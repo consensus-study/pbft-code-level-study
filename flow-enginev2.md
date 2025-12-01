@@ -611,34 +611,49 @@ resp, err := a.client.FinalizeBlock(ctx, req)
 Node0          Node1          Node2          Node3
 (리더)
   │
-  │ ─── PrePrepare ──────────────────────────────────────────▶
+  │ ─── PrePrepare ───▶│              │              │
+  │ ─── PrePrepare ───────────────────▶              │
+  │ ─── PrePrepare ───────────────────────────────────▶
   │                    │              │              │
   │                    ▼              ▼              ▼
   │              ProcessProposal  ProcessProposal  ProcessProposal
   │              (블록 검증)       (블록 검증)       (블록 검증)
   │                    │              │              │
-  │ ◀─── Prepare ──────┘              │              │
-  │ ◀─── Prepare ─────────────────────┘              │
-  │ ◀─── Prepare ────────────────────────────────────┘
-  │
-  │  3개 수집 (2f+1 충족!)
-  │
-  │ ─── Commit ──────────────────────────────────────────────▶
-  │ ◀─── Commit ───────┐              │              │
-  │ ◀─── Commit ──────────────────────┘              │
-  │ ◀─── Commit ─────────────────────────────────────┘
-  │
-  │  3개 수집 (2f+1 충족!)
-  │
-  ▼
-executeBlock()         executeBlock()  executeBlock()  executeBlock()
-FinalizeBlock          FinalizeBlock   FinalizeBlock   FinalizeBlock
-Commit                 Commit          Commit          Commit
-
-  │
-  ▼
-블록 1 완료!
+  │                    │              │              │
+  ├─── Prepare ───────▶│              │              │  ┐
+  ├─── Prepare ───────────────────────▶              │  │ Node0도
+  ├─── Prepare ───────────────────────────────────────▶  ┘ 브로드캐스트
+  │ ◀── Prepare ───────┤──────────────▶──────────────▶  ← Node1 브로드캐스트
+  │ ◀── Prepare ───────────────────────┤─────────────▶  ← Node2 브로드캐스트
+  │ ◀── Prepare ───────────────────────────────────────┤ ← Node3 브로드캐스트
+  │                    │              │              │
+  │  (모든 노드가 Prepare 3개 이상 수집 → 2f+1 충족!)   │
+  │                    │              │              │
+  ├─── Commit ────────▶│              │              │  ┐
+  ├─── Commit ────────────────────────▶              │  │ Node0
+  ├─── Commit ────────────────────────────────────────▶  ┘ 브로드캐스트
+  │ ◀── Commit ────────┤──────────────▶──────────────▶  ← Node1 브로드캐스트
+  │ ◀── Commit ────────────────────────┤─────────────▶  ← Node2 브로드캐스트
+  │ ◀── Commit ────────────────────────────────────────┤ ← Node3 브로드캐스트
+  │                    │              │              │
+  │  (모든 노드가 Commit 3개 이상 수집 → 2f+1 충족!)    │
+  │                    │              │              │
+  ▼                    ▼              ▼              ▼
+executeBlock()    executeBlock()  executeBlock()  executeBlock()
+FinalizeBlock     FinalizeBlock   FinalizeBlock   FinalizeBlock
+Commit            Commit          Commit          Commit
+  │                    │              │              │
+  ▼                    ▼              ▼              ▼
+                    블록 1 완료!
 ```
+
+**메시지 발신 정리:**
+
+| 메시지 | 발신자 | 수신자 | 비고 |
+|--------|--------|--------|------|
+| PrePrepare | 리더(Node0)만 | 모든 노드 | 리더만 보냄 |
+| Prepare | **모든 노드** | **모든 노드** | 각자 브로드캐스트 |
+| Commit | **모든 노드** | **모든 노드** | 각자 브로드캐스트 |
 
 ---
 
@@ -1092,102 +1107,1209 @@ switch msg.Type:
 
 ## 8. 핵심 코드 분석
 
-### 8.1 리더 선출
+### 8.1 EngineV2 구조체 상세
 
 ```go
+// consensus/pbft/engine_v2.go
+
+type EngineV2 struct {
+    // 설정
+    config  *Config
+    chainID string
+    
+    // 상태
+    view        uint64  // 현재 뷰 (리더 번호)
+    sequenceNum uint64  // 현재 시퀀스 (= 블록 높이)
+    lastAppHash []byte  // 마지막 앱 해시
+    
+    // 검증자
+    validatorSet *types.ValidatorSet
+    
+    // 상태 저장소
+    stateLog *StateLog  // 각 시퀀스별 상태 저장
+    
+    // 통신
+    transport   Transport            // P2P 통신
+    abciAdapter ABCIAdapterInterface // ABCI 어댑터
+    
+    // 채널
+    msgChan     chan *Message     // 메시지 수신
+    requestChan chan *RequestMsg  // 트랜잭션 수신
+    
+    // 뷰 체인지
+    viewChangeManager *ViewChangeManager
+    viewChangeTimer   *time.Timer
+    
+    // 블록 저장
+    committedBlocks []*types.Block
+    
+    // 동기화
+    mu      sync.RWMutex
+    running bool
+    done    chan struct{}
+}
+```
+
+**각 필드 설명:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  필드              │  타입                    │  역할                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  view              │  uint64                  │  현재 리더 번호          │
+│  sequenceNum       │  uint64                  │  다음 블록 높이          │
+│  lastAppHash       │  []byte                  │  앱 상태 해시            │
+│  validatorSet      │  *ValidatorSet           │  검증자 목록             │
+│  stateLog          │  *StateLog               │  시퀀스별 합의 상태      │
+│  transport         │  Transport               │  P2P 메시지 송수신       │
+│  abciAdapter       │  ABCIAdapterInterface    │  Cosmos SDK 연결         │
+│  msgChan           │  chan *Message           │  받은 메시지 큐          │
+│  requestChan       │  chan *RequestMsg        │  받은 트랜잭션 큐        │
+│  viewChangeManager │  *ViewChangeManager      │  뷰 체인지 관리          │
+│  viewChangeTimer   │  *time.Timer             │  뷰 체인지 타이머        │
+│  committedBlocks   │  []*Block                │  완료된 블록들           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 ABCIAdapterInterface
+
+```go
+// consensus/pbft/abci_adapter.go
+
+type ABCIAdapterInterface interface {
+    // 생명주기
+    Close() error
+    
+    // 체인 초기화
+    InitChain(ctx context.Context, chainID string, validators []*types.Validator, appState []byte) error
+    
+    // 블록 제안 (리더용)
+    PrepareProposal(ctx context.Context, height int64, proposer []byte, txs [][]byte) ([][]byte, error)
+    
+    // 블록 검증 (팔로워용)
+    ProcessProposal(ctx context.Context, height int64, proposer []byte, txs [][]byte, hash []byte) (bool, error)
+    
+    // 블록 실행
+    FinalizeBlock(ctx context.Context, block *types.Block) (*ABCIExecutionResult, error)
+    
+    // 상태 확정
+    Commit(ctx context.Context) (appHash []byte, retainHeight int64, err error)
+    
+    // 트랜잭션 검증
+    CheckTx(ctx context.Context, tx []byte) (*abci.ResponseCheckTx, error)
+    
+    // 상태 조회/설정
+    GetLastAppHash() []byte
+    GetLastHeight() int64
+    SetLastAppHash(hash []byte)
+}
+```
+
+**메서드별 호출 시점:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  메서드            │  호출 시점                   │  호출자              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  InitChain         │  노드 최초 시작 시            │  Node.Start()        │
+│  PrepareProposal   │  블록 제안 시                │  proposeBlock()      │
+│  ProcessProposal   │  PrePrepare 수신 시          │  handlePrePrepare()  │
+│  FinalizeBlock     │  Commit 완료 후              │  executeBlock()      │
+│  Commit            │  FinalizeBlock 후            │  executeBlock()      │
+│  CheckTx           │  트랜잭션 수신 시 (선택)      │  SubmitRequest()     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 리더 선출 로직
+
+```go
+// 현재 노드가 리더인지 확인
 func (e *EngineV2) isPrimary() bool {
     primaryIdx := int(e.view) % len(e.validatorSet.Validators)
     return e.validatorSet.Validators[primaryIdx].ID == e.config.NodeID
 }
+
+// 현재 리더 ID 반환
+func (e *EngineV2) getPrimaryID() string {
+    primaryIdx := int(e.view) % len(e.validatorSet.Validators)
+    return e.validatorSet.Validators[primaryIdx].ID
+}
 ```
 
+**동작 예시:**
+
 ```
-view = 0: node0이 리더 (0 % 4 = 0)
-view = 1: node1이 리더 (1 % 4 = 1)
-view = 2: node2가 리더 (2 % 4 = 2)
-view = 3: node3이 리더 (3 % 4 = 3)
-view = 4: node0이 리더 (4 % 4 = 0)  ← 다시 순환
+Validators = ["node0", "node1", "node2", "node3"]  (4개)
+
+view = 0: primaryIdx = 0 % 4 = 0 → node0이 리더
+view = 1: primaryIdx = 1 % 4 = 1 → node1이 리더
+view = 2: primaryIdx = 2 % 4 = 2 → node2가 리더
+view = 3: primaryIdx = 3 % 4 = 3 → node3이 리더
+view = 4: primaryIdx = 4 % 4 = 0 → node0이 리더 (순환)
+view = 5: primaryIdx = 5 % 4 = 1 → node1이 리더
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  뷰가 바뀌면 리더가 바뀜 (Round-Robin 방식)                               │
+│  뷰 체인지는 리더가 응답 없을 때 발생                                      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Quorum 계산
+### 8.4 Quorum 계산
 
 ```go
+// types/validator.go
+
 func (vs *ValidatorSet) QuorumSize() int {
     n := len(vs.Validators)
     f := (n - 1) / 3  // 허용 가능한 Byzantine 노드 수
     return 2*f + 1    // 필요한 최소 투표 수
 }
+
+// f 계산: 3f + 1 <= n 을 만족하는 최대 f
+// 4개 노드: 3f + 1 <= 4 → f <= 1 → f = 1
+// 7개 노드: 3f + 1 <= 7 → f <= 2 → f = 2
 ```
 
+**Quorum 테이블:**
+
 ```
-4개 노드: f = 1, quorum = 3
-7개 노드: f = 2, quorum = 5
-10개 노드: f = 3, quorum = 7
+┌─────────────────────────────────────────────────────────────────────────┐
+│  노드 수 (n)  │  Byzantine (f)  │  Quorum (2f+1)  │  안전 조건          │
+├─────────────────────────────────────────────────────────────────────────┤
+│      4        │       1         │       3         │  1개 악의적 허용     │
+│      5        │       1         │       3         │  1개 악의적 허용     │
+│      6        │       1         │       3         │  1개 악의적 허용     │
+│      7        │       2         │       5         │  2개 악의적 허용     │
+│     10        │       3         │       7         │  3개 악의적 허용     │
+│     13        │       4         │       9         │  4개 악의적 허용     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+PBFT 공식: n >= 3f + 1 (최소 노드 수)
 ```
 
-### 8.3 상태 전이
+### 8.5 메인 루프 (run)
 
 ```go
-// handlePrepare에서
-if state.IsPrepared(quorum) && state.GetPhase() == PrePrepared {
-    state.TransitionToPrepared()  // PrePrepared → Prepared
-    e.broadcast(commitMsg)
+// consensus/pbft/engine_v2.go
+
+func (e *EngineV2) run() {
+    for {
+        select {
+        case <-e.done:
+            // 종료 신호
+            return
+            
+        case msg := <-e.msgChan:
+            // 다른 노드로부터 메시지 수신
+            e.handleMessage(msg)
+            
+        case req := <-e.requestChan:
+            // 클라이언트로부터 트랜잭션 수신
+            if e.isPrimary() {
+                // 리더만 블록 제안
+                e.proposeBlock(req)
+            }
+            // 팔로워는 무시 (리더가 제안할 때까지 대기)
+            
+        case <-e.viewChangeTimer.C:
+            // 타임아웃 발생 → 뷰 체인지 시작
+            e.startViewChange()
+        }
+    }
 }
-
-// handleCommit에서
-if state.IsCommitted(quorum) && state.GetPhase() == Prepared {
-    state.TransitionToCommitted()  // Prepared → Committed
-    e.executeBlock(state)
-}
 ```
 
-```
-상태 전이 다이어그램:
+**메인 루프 흐름도:**
 
-   ┌─────────────┐   PrePrepare 수신   ┌─────────────┐
-   │   Initial   │ ─────────────────▶  │ PrePrepared │
-   └─────────────┘                     └──────┬──────┘
-                                              │
-                                              │ 2f+1 Prepare 수집
-                                              ▼
-                                       ┌─────────────┐
-                                       │  Prepared   │
-                                       └──────┬──────┘
-                                              │
-                                              │ 2f+1 Commit 수집
-                                              ▼
-                                       ┌─────────────┐
-                                       │  Committed  │
-                                       └──────┬──────┘
-                                              │
-                                              │ executeBlock()
-                                              ▼
-                                       ┌─────────────┐
-                                       │  Executed   │
-                                       └─────────────┘
+```
+                    ┌─────────────────┐
+                    │   run() 시작    │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+              ┌────▶│  select 대기    │◀────┐
+              │     └────────┬────────┘     │
+              │              │              │
+              │    ┌─────────┼─────────┐    │
+              │    │         │         │    │
+              │    ▼         ▼         ▼    │
+              │ ┌─────┐  ┌─────┐  ┌─────┐   │
+              │ │done │  │msg  │  │req  │   │
+              │ │Chan │  │Chan │  │Chan │   │
+              │ └──┬──┘  └──┬──┘  └──┬──┘   │
+              │    │        │        │      │
+              │    ▼        ▼        ▼      │
+              │ return   handle   propose   │
+              │          Message  Block     │
+              │            │        │       │
+              └────────────┴────────┴───────┘
 ```
 
-### 8.4 검증자 업데이트
+### 8.6 proposeBlock (블록 제안)
 
 ```go
-func (e *EngineV2) handleValidatorUpdates(updates []abci.ValidatorUpdate) {
+func (e *EngineV2) proposeBlock(req *RequestMsg) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    // 1. 시퀀스 번호 증가
+    e.sequenceNum++
+    seqNum := e.sequenceNum
+    
+    // 2. 트랜잭션 수집
+    txs := [][]byte{req.Operation}
+    // 실제로는 여러 트랜잭션을 모아서 배치 처리
+    
+    // 3. ABCI PrepareProposal 호출
+    //    앱이 트랜잭션 정렬/필터링
+    ctx := context.Background()
+    height := int64(seqNum)
+    proposer := []byte(e.config.NodeID)
+    
+    preparedTxs, err := e.abciAdapter.PrepareProposal(ctx, height, proposer, txs)
+    if err != nil {
+        log.Printf("PrepareProposal failed: %v", err)
+        return
+    }
+    
+    // 4. 트랜잭션을 Transaction 타입으로 변환
+    transactions := make([]*types.Transaction, len(preparedTxs))
+    for i, tx := range preparedTxs {
+        transactions[i] = &types.Transaction{
+            ID:        fmt.Sprintf("tx-%d-%d", seqNum, i),
+            Data:      tx,
+            Timestamp: time.Now(),
+        }
+    }
+    
+    // 5. 블록 생성
+    prevHash := e.lastAppHash
+    if prevHash == nil {
+        prevHash = []byte{}
+    }
+    
+    block := types.NewBlock(seqNum, prevHash, e.config.NodeID, e.view, transactions)
+    
+    // 6. PrePrepare 메시지 생성
+    prePrepareMsg := &PrePrepareMsg{
+        View:        e.view,
+        SequenceNum: seqNum,
+        Digest:      block.Hash,
+        Block:       block,
+        PrimaryID:   e.config.NodeID,
+    }
+    
+    // 7. StateLog에 저장
+    state := e.stateLog.GetOrCreate(seqNum, e.view)
+    state.SetPrePrepare(prePrepareMsg, block)
+    state.TransitionToPrePrepared()
+    
+    // 8. 메시지 직렬화
+    payload, err := json.Marshal(prePrepareMsg)
+    if err != nil {
+        log.Printf("Failed to marshal PrePrepare: %v", err)
+        return
+    }
+    
+    msg := &Message{
+        Type:        PrePrepare,
+        View:        e.view,
+        SequenceNum: seqNum,
+        Digest:      block.Hash,
+        NodeID:      e.config.NodeID,
+        Timestamp:   time.Now(),
+        Payload:     payload,
+    }
+    
+    // 9. 서명 (선택적)
+    // msg.Signature = e.sign(msg)
+    
+    // 10. 브로드캐스트
+    e.broadcast(msg)
+    
+    // 11. 자신의 Prepare도 전송
+    e.sendPrepare(seqNum, block.Hash)
+    
+    // 12. 타이머 리셋
+    e.resetViewChangeTimer()
+    
+    log.Printf("[%s] Proposed block %d with %d txs", e.config.NodeID, seqNum, len(transactions))
+}
+```
+
+**proposeBlock 흐름도:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          proposeBlock()                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+         ┌────────────────────────┼────────────────────────┐
+         │                        │                        │
+         ▼                        ▼                        ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ 1. seqNum++     │    │ 2. txs 수집     │    │ 3. PrepareProposal│
+│                 │    │                 │    │    (ABCI 호출)    │
+└────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+         │                      │                      │
+         └──────────────────────┼──────────────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────┐
+                    │ 4. Transaction 변환 │
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 5. Block 생성       │
+                    │  NewBlock(...)      │
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 6. PrePrepareMsg    │
+                    │    생성             │
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 7. StateLog 저장    │
+                    │  state.SetPrePrepare│
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 8-9. 직렬화 & 서명  │
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 10. broadcast()     │
+                    │  → 모든 노드에 전송  │
+                    └────────┬────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐
+                    │ 11. sendPrepare()   │
+                    │  → 자신의 Prepare   │
+                    └─────────────────────┘
+```
+
+### 8.7 handlePrePrepare (PrePrepare 처리)
+
+```go
+func (e *EngineV2) handlePrePrepare(msg *Message) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    // 1. 뷰 확인
+    if msg.View != e.view {
+        log.Printf("PrePrepare view mismatch: got %d, expected %d", msg.View, e.view)
+        return
+    }
+    
+    // 2. 리더 확인 (PrePrepare는 리더만 보낼 수 있음)
+    if msg.NodeID != e.getPrimaryID() {
+        log.Printf("PrePrepare from non-primary: %s", msg.NodeID)
+        return
+    }
+    
+    // 3. 이미 처리한 시퀀스인지 확인
+    if msg.SequenceNum <= e.getLastCommittedSeqNum() {
+        log.Printf("PrePrepare for already committed sequence: %d", msg.SequenceNum)
+        return
+    }
+    
+    // 4. Payload 디코딩
+    var prePrepareMsg PrePrepareMsg
+    if err := json.Unmarshal(msg.Payload, &prePrepareMsg); err != nil {
+        log.Printf("Failed to unmarshal PrePrepare: %v", err)
+        return
+    }
+    
+    block := prePrepareMsg.Block
+    
+    // 5. 블록 해시 검증
+    if !bytes.Equal(block.Hash, msg.Digest) {
+        log.Printf("Block hash mismatch")
+        return
+    }
+    
+    // 6. ABCI ProcessProposal 호출 (블록 검증)
+    ctx := context.Background()
+    height := int64(msg.SequenceNum)
+    proposer := []byte(msg.NodeID)
+    
+    txs := make([][]byte, len(block.Transactions))
+    for i, tx := range block.Transactions {
+        txs[i] = tx.Data
+    }
+    
+    accepted, err := e.abciAdapter.ProcessProposal(ctx, height, proposer, txs, block.Hash)
+    if err != nil {
+        log.Printf("ProcessProposal failed: %v", err)
+        return
+    }
+    
+    // 7. 거부되면 종료
+    if !accepted {
+        log.Printf("Block rejected by ProcessProposal")
+        return
+    }
+    
+    // 8. StateLog에 저장
+    state := e.stateLog.GetOrCreate(msg.SequenceNum, msg.View)
+    state.SetPrePrepare(&prePrepareMsg, block)
+    state.TransitionToPrePrepared()
+    
+    // 9. Prepare 메시지 브로드캐스트
+    e.sendPrepare(msg.SequenceNum, block.Hash)
+    
+    // 10. 타이머 리셋
+    e.resetViewChangeTimer()
+    
+    log.Printf("[%s] Accepted PrePrepare for block %d", e.config.NodeID, msg.SequenceNum)
+}
+```
+
+**handlePrePrepare 검증 단계:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     handlePrePrepare() 검증                              │
+└─────────────────────────────────────────────────────────────────────────┘
+
+메시지 수신
+    │
+    ▼
+┌─────────────────┐     실패
+│ 1. 뷰 확인      │────────────▶ return (무시)
+│ msg.View == e.view?           "뷰가 다름"
+└────────┬────────┘
+         │ 성공
+         ▼
+┌─────────────────┐     실패
+│ 2. 리더 확인    │────────────▶ return (무시)
+│ msg.NodeID == primary?        "리더가 아님"
+└────────┬────────┘
+         │ 성공
+         ▼
+┌─────────────────┐     실패
+│ 3. 시퀀스 확인  │────────────▶ return (무시)
+│ seqNum > lastCommitted?       "이미 커밋됨"
+└────────┬────────┘
+         │ 성공
+         ▼
+┌─────────────────┐     실패
+│ 4. 디코딩       │────────────▶ return (무시)
+│ json.Unmarshal()              "파싱 실패"
+└────────┬────────┘
+         │ 성공
+         ▼
+┌─────────────────┐     실패
+│ 5. 해시 검증    │────────────▶ return (무시)
+│ block.Hash == digest?         "해시 불일치"
+└────────┬────────┘
+         │ 성공
+         ▼
+┌─────────────────┐     REJECT
+│ 6. ProcessProposal│───────────▶ return (무시)
+│ ABCI 블록 검증    │           "앱이 거부"
+└────────┬────────┘
+         │ ACCEPT
+         ▼
+┌─────────────────┐
+│ 7. 저장 & Prepare│
+│    브로드캐스트  │
+└─────────────────┘
+```
+
+### 8.8 handlePrepare (Prepare 처리)
+
+```go
+func (e *EngineV2) handlePrepare(msg *Message) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    // 1. 뷰 확인
+    if msg.View != e.view {
+        return
+    }
+    
+    // 2. 상태 가져오기
+    state := e.stateLog.Get(msg.SequenceNum, msg.View)
+    if state == nil {
+        // PrePrepare를 아직 못 받음 → 나중에 처리하도록 버퍼에 저장
+        e.bufferMessage(msg)
+        return
+    }
+    
+    // 3. Digest 확인 (같은 블록에 대한 Prepare인지)
+    if !bytes.Equal(msg.Digest, state.GetDigest()) {
+        log.Printf("Prepare digest mismatch")
+        return
+    }
+    
+    // 4. Prepare 메시지 저장
+    prepareMsg := &PrepareMsg{
+        View:        msg.View,
+        SequenceNum: msg.SequenceNum,
+        Digest:      msg.Digest,
+        NodeID:      msg.NodeID,
+    }
+    state.AddPrepare(prepareMsg)
+    
+    // 5. Quorum 확인 (2f+1개 이상 모았나?)
+    quorum := e.validatorSet.QuorumSize()
+    
+    if state.PrepareCount() >= quorum && state.GetPhase() == PrePrepared {
+        // 6. Prepared 상태로 전이
+        state.TransitionToPrepared()
+        
+        // 7. Commit 메시지 브로드캐스트
+        e.sendCommit(msg.SequenceNum, msg.Digest)
+        
+        log.Printf("[%s] Block %d prepared with %d prepares", 
+            e.config.NodeID, msg.SequenceNum, state.PrepareCount())
+    }
+}
+```
+
+**Prepare 수집 과정:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Prepare 메시지 수집                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+4개 노드, quorum = 3
+
+시간 →
+
+State.Prepares = []
+
+Node1의 Prepare 도착 → State.Prepares = [node1]  (1개)
+                       PrepareCount() = 1 < 3 (quorum)
+                       → 아직 부족, 대기
+
+Node2의 Prepare 도착 → State.Prepares = [node1, node2]  (2개)
+                       PrepareCount() = 2 < 3 (quorum)
+                       → 아직 부족, 대기
+
+Node0의 Prepare 도착 → State.Prepares = [node1, node2, node0]  (3개)
+                       PrepareCount() = 3 >= 3 (quorum)
+                       → Quorum 충족! Commit 전송!
+
+Node3의 Prepare 도착 → State.Prepares = [node1, node2, node0, node3]  (4개)
+                       이미 Prepared 상태 → 무시 (이미 Commit 보냄)
+```
+
+### 8.9 handleCommit (Commit 처리)
+
+```go
+func (e *EngineV2) handleCommit(msg *Message) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    // 1. 뷰 확인
+    if msg.View != e.view {
+        return
+    }
+    
+    // 2. 상태 가져오기
+    state := e.stateLog.Get(msg.SequenceNum, msg.View)
+    if state == nil {
+        e.bufferMessage(msg)
+        return
+    }
+    
+    // 3. Digest 확인
+    if !bytes.Equal(msg.Digest, state.GetDigest()) {
+        return
+    }
+    
+    // 4. Commit 메시지 저장
+    commitMsg := &CommitMsg{
+        View:        msg.View,
+        SequenceNum: msg.SequenceNum,
+        Digest:      msg.Digest,
+        NodeID:      msg.NodeID,
+    }
+    state.AddCommit(commitMsg)
+    
+    // 5. Quorum 확인
+    quorum := e.validatorSet.QuorumSize()
+    
+    if state.CommitCount() >= quorum && state.GetPhase() == Prepared {
+        // 6. Committed 상태로 전이
+        state.TransitionToCommitted()
+        
+        // 7. 블록 실행!
+        e.executeBlock(state)
+        
+        log.Printf("[%s] Block %d committed with %d commits",
+            e.config.NodeID, msg.SequenceNum, state.CommitCount())
+    }
+}
+```
+
+### 8.10 executeBlock (블록 실행)
+
+```go
+func (e *EngineV2) executeBlock(state *State) {
+    block := state.Block
+    
+    // 1. ABCI FinalizeBlock 호출
+    ctx := context.Background()
+    result, err := e.abciAdapter.FinalizeBlock(ctx, block)
+    if err != nil {
+        log.Printf("FinalizeBlock failed: %v", err)
+        return
+    }
+    
+    // 2. 트랜잭션 결과 확인
+    for i, txResult := range result.TxResults {
+        if txResult.Code != 0 {
+            // 트랜잭션 실패 (Code != 0은 에러)
+            log.Printf("Tx %d failed: code=%d, log=%s", i, txResult.Code, txResult.Log)
+        }
+    }
+    
+    // 3. ABCI Commit 호출 (상태 확정)
+    appHash, retainHeight, err := e.abciAdapter.Commit(ctx)
+    if err != nil {
+        log.Printf("Commit failed: %v", err)
+        return
+    }
+    
+    // 4. 상태 업데이트
+    e.lastAppHash = result.AppHash
+    state.MarkExecuted()
+    e.committedBlocks = append(e.committedBlocks, block)
+    
+    // 5. 검증자 업데이트 처리
+    if len(result.ValidatorUpdates) > 0 {
+        e.handleValidatorUpdates(result.ValidatorUpdates)
+    }
+    
+    // 6. 체크포인트 생성 (주기적)
+    if state.SequenceNum % e.config.CheckpointInterval == 0 {
+        e.createCheckpoint(state.SequenceNum)
+    }
+    
+    // 7. 다음 블록 준비
+    e.resetViewChangeTimer()
+    
+    log.Printf("[%s] Executed block %d, appHash=%x, retainHeight=%d",
+        e.config.NodeID, state.SequenceNum, appHash, retainHeight)
+}
+```
+
+**executeBlock 흐름도:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           executeBlock()                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌─────────────────────────┐
+                    │ 1. FinalizeBlock 호출   │
+                    │    (블록 실행)           │
+                    │                         │
+                    │  abciAdapter.Finalize   │
+                    │  Block(ctx, block)      │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ 2. 트랜잭션 결과 확인   │
+                    │                         │
+                    │  for tx in TxResults:   │
+                    │    if tx.Code != 0:     │
+                    │      log("failed")      │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ 3. Commit 호출          │
+                    │    (상태 확정)           │
+                    │                         │
+                    │  abciAdapter.Commit()   │
+                    │  → appHash, retainHeight│
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ 4. 상태 업데이트        │
+                    │                         │
+                    │  e.lastAppHash = ...    │
+                    │  committedBlocks.append │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ 5. 검증자 업데이트      │
+                    │                         │
+                    │  handleValidatorUpdates │
+                    │  (Power 변경 처리)      │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │ 6. 체크포인트 생성      │
+                    │    (100블록마다)        │
+                    └─────────────────────────┘
+```
+
+### 8.11 ABCIAdapter 상세
+
+```go
+// consensus/pbft/abci_adapter.go
+
+type ABCIAdapter struct {
+    client      *abciclient.Client
+    lastHeight  int64
+    lastAppHash []byte
+    maxTxBytes  int64
+    chainID     string
+    mu          sync.RWMutex
+}
+
+// 생성자
+func NewABCIAdapter(abciAddress string, chainID string) (*ABCIAdapter, error) {
+    config := &abciclient.Config{
+        Address: abciAddress,
+        Timeout: 10 * time.Second,
+    }
+    
+    client, err := abciclient.NewClient(config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create ABCI client: %w", err)
+    }
+    
+    return &ABCIAdapter{
+        client:     client,
+        maxTxBytes: 1024 * 1024,  // 1MB
+        chainID:    chainID,
+    }, nil
+}
+```
+
+### 8.12 ABCIAdapter.FinalizeBlock 상세
+
+```go
+func (a *ABCIAdapter) FinalizeBlock(ctx context.Context, block *types.Block) (*ABCIExecutionResult, error) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    
+    // 1. 트랜잭션 추출 (Transaction 구조체 → raw bytes)
+    txs := make([][]byte, len(block.Transactions))
+    for i, tx := range block.Transactions {
+        txs[i] = tx.Data
+    }
+    
+    // 2. BlockData 생성 (PBFT 타입 → 중간 타입)
+    blockData := &abciclient.BlockData{
+        Height:       int64(block.Header.Height),
+        Txs:          txs,
+        Hash:         block.Hash,
+        Time:         block.Header.Timestamp,
+        ProposerAddr: []byte(block.Header.ProposerID),
+    }
+    
+    // 3. ABCI Request 생성 (중간 타입 → ABCI 타입)
+    req := abciclient.NewFinalizeBlockRequest(blockData)
+    
+    // 4. gRPC 호출
+    resp, err := a.client.FinalizeBlock(ctx, req)
+    if err != nil {
+        return nil, fmt.Errorf("FinalizeBlock failed: %w", err)
+    }
+    
+    // 5. Response → Result 변환
+    result := abciclient.FinalizeBlockResponseToResult(resp)
+    
+    // 6. 상태 업데이트
+    a.lastHeight = int64(block.Header.Height)
+    a.lastAppHash = result.AppHash
+    
+    // 7. 결과 반환
+    return &ABCIExecutionResult{
+        TxResults:        convertTxResults(result.TxResults),
+        ValidatorUpdates: result.ValidatorUpdates,
+        AppHash:          result.AppHash,
+        Events:           result.Events,
+    }, nil
+}
+```
+
+**타입 변환 과정:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    FinalizeBlock 타입 변환                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+[PBFT 타입]                    [중간 타입]                 [ABCI 타입]
+types.Block                    BlockData                   RequestFinalizeBlock
+┌─────────────────┐           ┌─────────────────┐         ┌─────────────────┐
+│ Header:         │           │                 │         │                 │
+│   Height: 100   │ ────────▶ │ Height: 100     │ ──────▶ │ Height: 100     │
+│   Timestamp     │           │ Time            │         │ Time            │
+│   ProposerID    │           │ ProposerAddr    │         │ ProposerAddress │
+│ Transactions:   │           │ Txs: [][]byte   │         │ Txs             │
+│   []*Transaction│           │                 │         │                 │
+│ Hash            │           │ Hash            │         │ Hash            │
+└─────────────────┘           └─────────────────┘         └─────────────────┘
+
+Transaction 변환:
+┌─────────────────────────────────────────────────────────────────────────┐
+│  types.Transaction          │        []byte                            │
+│  ┌─────────────────┐        │        ┌─────────────────┐               │
+│  │ ID: "tx-1"      │        │        │                 │               │
+│  │ Data: [bytes]   │ ──────▶│ ──────▶│ [raw bytes]     │               │
+│  │ Timestamp       │        │        │                 │               │
+│  │ Signature       │        │        └─────────────────┘               │
+│  └─────────────────┘        │                                          │
+│                             │  Data 필드만 추출                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.13 ABCI Client 상세
+
+```go
+// abci/client.go
+
+type Client struct {
+    conn       *grpc.ClientConn
+    client     abci.ABCIClient
+    address    string
+    timeout    time.Duration
+    lastHeight int64
+    lastAppHash []byte
+    mu         sync.Mutex
+}
+
+// gRPC 연결 생성
+func NewClient(config *Config) (*Client, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
+    defer cancel()
+    
+    // gRPC 연결 옵션
+    opts := []grpc.DialOption{
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+        grpc.WithBlock(),  // 연결될 때까지 블록
+    }
+    
+    // 연결
+    conn, err := grpc.DialContext(ctx, config.Address, opts...)
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect: %w", err)
+    }
+    
+    return &Client{
+        conn:    conn,
+        client:  abci.NewABCIClient(conn),
+        address: config.Address,
+        timeout: config.Timeout,
+    }, nil
+}
+
+// FinalizeBlock gRPC 호출
+func (c *Client) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    // 타임아웃 설정
+    ctx, cancel := context.WithTimeout(ctx, c.timeout)
+    defer cancel()
+    
+    // gRPC 호출
+    resp, err := c.client.FinalizeBlock(ctx, req)
+    if err != nil {
+        return nil, fmt.Errorf("FinalizeBlock RPC failed: %w", err)
+    }
+    
+    return resp, nil
+}
+```
+
+### 8.14 상태 전이 (State)
+
+```go
+// consensus/pbft/state.go
+
+type Phase int
+
+const (
+    PhaseInitial Phase = iota
+    PhasePrePrepared
+    PhasePrepared
+    PhaseCommitted
+    PhaseExecuted
+)
+
+type State struct {
+    View        uint64
+    SequenceNum uint64
+    Phase       Phase
+    
+    PrePrepare *PrePrepareMsg
+    Block      *types.Block
+    Prepares   map[string]*PrepareMsg   // nodeID → Prepare
+    Commits    map[string]*CommitMsg    // nodeID → Commit
+    
+    mu sync.RWMutex
+}
+
+func (s *State) TransitionToPrePrepared() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.Phase == PhaseInitial {
+        s.Phase = PhasePrePrepared
+    }
+}
+
+func (s *State) TransitionToPrepared() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.Phase == PhasePrePrepared {
+        s.Phase = PhasePrepared
+    }
+}
+
+func (s *State) TransitionToCommitted() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.Phase == PhasePrepared {
+        s.Phase = PhaseCommitted
+    }
+}
+
+func (s *State) PrepareCount() int {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    return len(s.Prepares)
+}
+
+func (s *State) CommitCount() int {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    return len(s.Commits)
+}
+```
+
+**상태 전이 다이어그램:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          상태 전이 다이어그램                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+   ┌─────────────┐
+   │   Initial   │  ← State 생성 직후
+   └──────┬──────┘
+          │
+          │ PrePrepare 수신 & 저장
+          │ state.SetPrePrepare()
+          ▼
+   ┌─────────────┐
+   │ PrePrepared │  ← 블록 데이터 저장됨
+   └──────┬──────┘
+          │
+          │ Prepare 2f+1개 수집
+          │ PrepareCount() >= quorum
+          ▼
+   ┌─────────────┐
+   │  Prepared   │  ← Commit 보내도 됨
+   └──────┬──────┘
+          │
+          │ Commit 2f+1개 수집
+          │ CommitCount() >= quorum
+          ▼
+   ┌─────────────┐
+   │  Committed  │  ← 블록 실행해도 됨
+   └──────┬──────┘
+          │
+          │ executeBlock() 완료
+          │ state.MarkExecuted()
+          ▼
+   ┌─────────────┐
+   │  Executed   │  ← 완료!
+   └─────────────┘
+```
+
+### 8.15 검증자 업데이트
+
+```go
+func (e *EngineV2) handleValidatorUpdates(updates []*abci.ValidatorUpdate) {
     for _, update := range updates {
+        pubKeyData := update.PubKey.GetEd25519()
+        
         if update.Power == 0 {
-            // 검증자 제거
-            e.validatorSet.RemoveByPubKey(update.PubKey.Data)
+            // Power가 0이면 검증자 제거
+            e.validatorSet.RemoveByPubKey(pubKeyData)
+            log.Printf("Removed validator: %x", pubKeyData[:8])
         } else {
-            // 검증자 추가/업데이트
-            e.validatorSet.UpdateValidator(&types.Validator{
-                ID:        string(update.PubKey.Data),
-                PublicKey: update.PubKey.Data,
+            // Power가 0보다 크면 추가/업데이트
+            validator := &types.Validator{
+                ID:        hex.EncodeToString(pubKeyData[:8]),
+                PublicKey: pubKeyData,
                 Power:     update.Power,
-            })
+            }
+            e.validatorSet.UpdateValidator(validator)
+            log.Printf("Updated validator: %s, power: %d", validator.ID, update.Power)
         }
     }
     
     // Quorum 크기 재계산
-    e.viewChangeManager.UpdateQuorumSize(e.validatorSet.QuorumSize())
+    newQuorum := e.validatorSet.QuorumSize()
+    e.viewChangeManager.UpdateQuorumSize(newQuorum)
+    
+    log.Printf("Validator set updated: %d validators, quorum: %d",
+        len(e.validatorSet.Validators), newQuorum)
 }
+```
+
+**검증자 업데이트 예시:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        검증자 업데이트 예시                              │
+└─────────────────────────────────────────────────────────────────────────┘
+
+현재 상태:
+  Validators = [node0(10), node1(10), node2(10), node3(10)]
+  Quorum = 3
+
+업데이트 수신:
+  updates = [
+    {PubKey: node4_key, Power: 10},  // 새 검증자 추가
+    {PubKey: node1_key, Power: 0},   // node1 제거
+    {PubKey: node2_key, Power: 20},  // node2 파워 증가
+  ]
+
+처리 후:
+  Validators = [node0(10), node2(20), node3(10), node4(10)]
+  Quorum = 3  (4개 노드, 동일)
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Power의 의미:                                                          │
+│  - 투표력 (Voting Power)                                                │
+│  - 지분 증명에서는 스테이킹 양에 비례                                     │
+│  - Power가 높으면 리더 선출 확률 증가 (가중치 기반일 경우)                 │
+│  - Power = 0은 검증자 제거를 의미                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.16 View Change (리더 교체)
+
+```go
+// 뷰 체인지 시작
+func (e *EngineV2) startViewChange() {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    newView := e.view + 1
+    
+    // ViewChange 메시지 생성
+    viewChangeMsg := &ViewChangeMsg{
+        NewView:     newView,
+        LastSeqNum:  e.getLastCommittedSeqNum(),
+        Checkpoints: e.getStableCheckpoints(),
+        PreparedSet: e.getPreparedCertificates(),
+        NodeID:      e.config.NodeID,
+    }
+    
+    // ViewChangeManager에 등록
+    e.viewChangeManager.AddViewChange(viewChangeMsg)
+    
+    // 브로드캐스트
+    e.broadcastViewChange(viewChangeMsg)
+    
+    log.Printf("[%s] Started view change to view %d", e.config.NodeID, newView)
+}
+
+// ViewChange 메시지 처리
+func (e *EngineV2) handleViewChange(msg *Message) {
+    var viewChangeMsg ViewChangeMsg
+    json.Unmarshal(msg.Payload, &viewChangeMsg)
+    
+    // ViewChangeManager에 추가
+    e.viewChangeManager.AddViewChange(&viewChangeMsg)
+    
+    // 새 리더인 경우, 2f+1개 모이면 NewView 브로드캐스트
+    if e.isNewPrimary(viewChangeMsg.NewView) {
+        if e.viewChangeManager.HasQuorum(viewChangeMsg.NewView) {
+            e.broadcastNewView(viewChangeMsg.NewView)
+        }
+    }
+}
+
+// NewView 메시지 처리
+func (e *EngineV2) handleNewView(msg *Message) {
+    var newViewMsg NewViewMsg
+    json.Unmarshal(msg.Payload, &newViewMsg)
+    
+    // 검증
+    if !e.validateNewView(&newViewMsg) {
+        return
+    }
+    
+    // 뷰 업데이트
+    e.view = newViewMsg.View
+    
+    // 타이머 리셋
+    e.resetViewChangeTimer()
+    
+    // 미처리 블록 재처리
+    for _, prePrepare := range newViewMsg.PrePrepareMsgs {
+        e.reprocessPrePrepare(&prePrepare)
+    }
+    
+    log.Printf("[%s] Entered new view %d", e.config.NodeID, e.view)
+}
+```
+
+**View Change 흐름:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         View Change 흐름                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+정상 상황 (view = 0, 리더 = node0):
+  node0 → PrePrepare → node1, node2, node3 → Prepare → Commit → 완료
+
+리더 장애 상황:
+  node0이 응답 없음...
+  
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  viewChangeTimer 만료!                                              │
+  │                                                                     │
+  │  node1: "10초 지났는데 리더가 안 보내네? → ViewChange 시작!"          │
+  │  node2: "나도! → ViewChange 시작!"                                   │
+  │  node3: "나도! → ViewChange 시작!"                                   │
+  └─────────────────────────────────────────────────────────────────────┘
+  
+  ViewChange 메시지 교환 (view = 0 → 1):
+  
+  node1 ─── ViewChange(newView=1) ───▶ node2, node3
+  node2 ─── ViewChange(newView=1) ───▶ node1, node3
+  node3 ─── ViewChange(newView=1) ───▶ node1, node2
+  
+  새 리더 (node1)가 2f+1개 ViewChange 수집:
+  
+  node1: "ViewChange 3개 모았다! → NewView 브로드캐스트!"
+  
+  node1 ─── NewView(view=1) ───▶ node2, node3
+  
+  새 뷰 시작:
+  
+  view = 1, 리더 = node1 (1 % 4 = 1)
+  node1이 새 블록 제안 시작!
 ```
 
 ---
@@ -1280,10 +2402,3 @@ func (e *EngineV2) handleValidatorUpdates(updates []abci.ValidatorUpdate) {
    - 코드 가독성 향상
 ```
 
----
-
-## 끝
-
-이 문서가 PBFT-Cosmos 코드를 이해하는 데 도움이 되길 바랍니다!
-
-질문이 있으면 언제든 물어보세요. 🚀
