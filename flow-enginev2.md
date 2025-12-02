@@ -2911,9 +2911,921 @@ node0.Broadcast(PrePrepare)
 
 ---
 
-## 9. 요약 정리
+## 9. Mempool (트랜잭션 풀) 상세
 
-### 9.1 계층 구조 요약
+### 9.1 Mempool 아키텍처
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              MEMPOOL                                         │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                         txStore (map)                                │    │
+│  │                    [txHash] -> *Tx                                   │    │
+│  │   ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐          │    │
+│  │   │tx1 │ │tx2 │ │tx3 │ │tx4 │ │tx5 │ │tx6 │ │tx7 │ │... │          │    │
+│  │   └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                      senderIndex (map)                               │    │
+│  │                  [sender] -> []*Tx (nonce 정렬)                      │    │
+│  │   ┌──────────────────┐  ┌──────────────────┐                        │    │
+│  │   │ sender_A:        │  │ sender_B:        │                        │    │
+│  │   │  [tx1, tx3, tx5] │  │  [tx2, tx4]      │                        │    │
+│  │   └──────────────────┘  └──────────────────┘                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                      priorityQueue (정렬)                            │    │
+│  │              (GasPrice 기준 우선순위 정렬)                            │    │
+│  │                                                                      │    │
+│  │   높은 우선순위 ◄─────────────────────────────► 낮은 우선순위        │    │
+│  │   [tx7:100] [tx3:80] [tx1:50] [tx5:30] [tx2:20] [tx4:10]            │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Mempool 역할:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Mempool = 대기실                                                        │
+│                                                                         │
+│  - 사용자가 보낸 트랜잭션을 임시 보관                                     │
+│  - 블록에 포함될 때까지 대기                                              │
+│  - 우선순위(가스 가격) 기준 정렬                                          │
+│  - 중복/무효 트랜잭션 필터링                                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 Tx 구조체 (mempool/tx.go)
+
+```go
+// mempool/tx.go
+
+// Tx represents a transaction in the mempool.
+type Tx struct {
+    // 트랜잭션 식별자
+    Hash []byte // SHA256 해시
+    ID   string // 해시의 hex 문자열
+
+    // 트랜잭션 데이터
+    Data []byte // 원본 트랜잭션 바이트
+
+    // 메타데이터
+    Sender    string    // 발신자 주소
+    Nonce     uint64    // 발신자별 순차 번호
+    GasPrice  uint64    // 가스 가격 (우선순위 결정용)
+    GasLimit  uint64    // 가스 한도
+    Timestamp time.Time // 멤풀 진입 시간
+
+    // 상태
+    Height    int64     // CheckTx 시점의 블록 높이
+    CheckedAt time.Time // 검증 시간
+}
+
+// NewTx creates a new transaction from raw bytes.
+func NewTx(data []byte) *Tx {
+    hash := sha256.Sum256(data)
+    return &Tx{
+        Hash:      hash[:],
+        ID:        hex.EncodeToString(hash[:]),
+        Data:      data,
+        Timestamp: time.Now(),
+        CheckedAt: time.Now(),
+    }
+}
+
+// NewTxWithMeta creates a new transaction with metadata.
+func NewTxWithMeta(data []byte, sender string, nonce, gasPrice, gasLimit uint64) *Tx {
+    tx := NewTx(data)
+    tx.Sender = sender
+    tx.Nonce = nonce
+    tx.GasPrice = gasPrice
+    tx.GasLimit = gasLimit
+    return tx
+}
+
+// Priority returns the priority score for ordering.
+// Higher gas price = higher priority.
+func (tx *Tx) Priority() uint64 {
+    return tx.GasPrice
+}
+```
+
+**Tx 필드 설명:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  필드          │  타입       │  설명                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Hash          │  []byte     │  SHA256(Data), 32바이트                  │
+│  ID            │  string     │  Hash의 hex 문자열, 조회용 키            │
+│  Data          │  []byte     │  원본 트랜잭션 바이트                    │
+│  Sender        │  string     │  발신자 주소 (예: "cosmos1abc...")       │
+│  Nonce         │  uint64     │  발신자별 순차 번호 (리플레이 방지)       │
+│  GasPrice      │  uint64     │  가스당 가격 (우선순위 = 높을수록 먼저)   │
+│  GasLimit      │  uint64     │  최대 가스 사용량                        │
+│  Timestamp     │  time.Time  │  멤풀 진입 시간 (TTL 계산용)             │
+│  Height        │  int64      │  검증 시점 블록 높이                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.3 Mempool 구조체
+
+```go
+// mempool/mempool.go
+
+type Mempool struct {
+    mu sync.RWMutex
+
+    // 설정
+    config *Config
+
+    // 트랜잭션 저장소
+    txStore map[string]*Tx // txHash -> Tx
+
+    // 발신자별 인덱스 (nonce 순서 유지)
+    senderIndex map[string][]*Tx // sender -> []*Tx (nonce 정렬)
+
+    // 현재 상태
+    txCount   int   // 현재 트랜잭션 수
+    txBytes   int64 // 현재 총 바이트
+    height    int64 // 현재 블록 높이
+    isRunning bool
+
+    // 발신자별 마지막 nonce 추적
+    senderNonce map[string]uint64 // sender -> lastNonce
+
+    // 최근 제거된 트랜잭션 캐시 (중복 방지)
+    recentlyRemoved map[string]time.Time
+
+    // 콜백 (ABCI CheckTx)
+    checkTxCallback CheckTxCallback
+
+    // 브로드캐스트 채널
+    newTxCh chan *Tx
+
+    // 종료
+    ctx    context.Context
+    cancel context.CancelFunc
+
+    // 메트릭
+    metrics *MempoolMetrics
+}
+```
+
+**저장소 구조:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          저장소 구조 비교                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+txStore (빠른 조회용):
+┌──────────────────────────────────────────────────────────┐
+│  Key (txID)              │  Value (*Tx)                  │
+├──────────────────────────────────────────────────────────┤
+│  "abc123..."             │  &Tx{ID: "abc123", ...}       │
+│  "def456..."             │  &Tx{ID: "def456", ...}       │
+│  "ghi789..."             │  &Tx{ID: "ghi789", ...}       │
+└──────────────────────────────────────────────────────────┘
+용도: O(1) 조회, 중복 체크
+
+
+senderIndex (발신자별 관리):
+┌──────────────────────────────────────────────────────────┐
+│  Key (sender)            │  Value ([]*Tx)                │
+├──────────────────────────────────────────────────────────┤
+│  "cosmos1alice..."       │  [tx1(nonce:1), tx3(nonce:2)] │
+│  "cosmos1bob..."         │  [tx2(nonce:5), tx4(nonce:6)] │
+└──────────────────────────────────────────────────────────┘
+용도: 같은 발신자의 트랜잭션 관리, nonce 순서 유지
+
+
+senderNonce (nonce 추적):
+┌──────────────────────────────────────────────────────────┐
+│  Key (sender)            │  Value (lastNonce)            │
+├──────────────────────────────────────────────────────────┤
+│  "cosmos1alice..."       │  2                            │
+│  "cosmos1bob..."         │  6                            │
+└──────────────────────────────────────────────────────────┘
+용도: 다음 nonce 검증, 리플레이 공격 방지
+```
+
+### 9.4 Config (설정)
+
+```go
+// mempool/mempool.go
+
+type Config struct {
+    // 크기 제한
+    MaxTxs      int   // 최대 트랜잭션 수 (기본: 5000)
+    MaxBytes    int64 // 최대 바이트 (기본: 1GB)
+    MaxTxBytes  int   // 단일 트랜잭션 최대 바이트 (기본: 1MB)
+    MaxBatchTxs int   // 한 번에 가져올 최대 트랜잭션 수 (기본: 500)
+
+    // TTL (Time To Live)
+    TTL time.Duration // 트랜잭션 만료 시간 (기본: 10분)
+
+    // 재검사
+    RecheckEnabled bool          // 블록 후 재검사 활성화
+    RecheckTimeout time.Duration // 재검사 타임아웃
+
+    // 캐시
+    CacheSize int // 최근 제거된 tx 캐시 크기
+
+    // 최소 가스 가격
+    MinGasPrice uint64
+}
+
+func DefaultConfig() *Config {
+    return &Config{
+        MaxTxs:         5000,
+        MaxBytes:       1024 * 1024 * 1024, // 1GB
+        MaxTxBytes:     1024 * 1024,        // 1MB
+        MaxBatchTxs:    500,
+        TTL:            10 * time.Minute,
+        RecheckEnabled: true,
+        RecheckTimeout: 5 * time.Second,
+        CacheSize:      10000,
+        MinGasPrice:    0,
+    }
+}
+```
+
+**설정값 의미:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  설정              │  기본값      │  의미                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  MaxTxs            │  5000        │  최대 5000개 트랜잭션 보관           │
+│  MaxBytes          │  1GB         │  총 크기 1GB 제한                   │
+│  MaxTxBytes        │  1MB         │  단일 트랜잭션 1MB 제한             │
+│  MaxBatchTxs       │  500         │  블록당 최대 500개 트랜잭션         │
+│  TTL               │  10분        │  10분 지나면 자동 삭제              │
+│  RecheckEnabled    │  true        │  블록 후 남은 tx 재검증             │
+│  MinGasPrice       │  0           │  최소 가스 가격 (스팸 방지)         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.5 트랜잭션 추가 (AddTx)
+
+```go
+// AddTxWithMeta adds a transaction with metadata.
+func (mp *Mempool) AddTxWithMeta(txBytes []byte, sender string, nonce, gasPrice, gasLimit uint64) error {
+    mp.mu.Lock()
+    defer mp.mu.Unlock()
+
+    if !mp.isRunning {
+        return ErrMempoolNotRunning
+    }
+
+    // 1. 크기 체크
+    if len(txBytes) > mp.config.MaxTxBytes {
+        return fmt.Errorf("%w: size %d > max %d", ErrTxTooLarge, len(txBytes), mp.config.MaxTxBytes)
+    }
+
+    // 2. 트랜잭션 생성
+    tx := NewTxWithMeta(txBytes, sender, nonce, gasPrice, gasLimit)
+
+    // 3. 중복 체크
+    if _, exists := mp.txStore[tx.ID]; exists {
+        return ErrTxAlreadyExists
+    }
+
+    // 4. 최근 제거된 트랜잭션 체크
+    if _, removed := mp.recentlyRemoved[tx.ID]; removed {
+        return ErrTxAlreadyExists
+    }
+
+    // 5. 최소 가스 가격 체크
+    if gasPrice < mp.config.MinGasPrice {
+        return fmt.Errorf("%w: price %d < min %d", ErrInsufficientGas, gasPrice, mp.config.MinGasPrice)
+    }
+
+    // 6. Nonce 체크
+    if sender != "" {
+        if err := mp.checkNonce(sender, nonce); err != nil {
+            return err
+        }
+    }
+
+    // 7. CheckTx 콜백 호출 (ABCI 검증)
+    if mp.checkTxCallback != nil {
+        if err := mp.checkTxCallback(tx); err != nil {
+            return fmt.Errorf("%w: %v", ErrInvalidTx, err)
+        }
+    }
+
+    // 8. 용량 체크 및 필요시 퇴출
+    if err := mp.ensureCapacity(tx); err != nil {
+        return err
+    }
+
+    // 9. 저장
+    mp.addTxLocked(tx)
+
+    // 10. 새 트랜잭션 알림
+    select {
+    case mp.newTxCh <- tx:
+    default:
+    }
+
+    return nil
+}
+```
+
+**AddTx 흐름도:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          트랜잭션 추가 흐름                              │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Client                   Mempool                    ABCI App
+    │                         │                          │
+    │   1. AddTx(txBytes)     │                          │
+    │ ───────────────────────►│                          │
+    │                         │                          │
+    │                         │ 2. 크기 체크              │
+    │                         │    (> 1MB? → 거부)        │
+    │                         │                          │
+    │                         │ 3. 중복 체크              │
+    │                         │    (txStore에 존재?)      │
+    │                         │                          │
+    │                         │ 4. 가스 가격 체크         │
+    │                         │    (< MinGasPrice?)      │
+    │                         │                          │
+    │                         │ 5. Nonce 체크            │
+    │                         │    (너무 낮거나 갭?)     │
+    │                         │                          │
+    │                         │ 6. CheckTx 콜백          │
+    │                         │ ────────────────────────►│
+    │                         │                          │ 앱에서 검증
+    │                         │◄────────────────────────│ (잔액, 서명 등)
+    │                         │                          │
+    │                         │ 7. 용량 체크             │
+    │                         │    (가득 찼으면 퇴출)    │
+    │                         │                          │
+    │                         │ 8. 저장                  │
+    │                         │    - txStore[id] = tx    │
+    │                         │    - senderIndex 갱신    │
+    │                         │                          │
+    │  9. nil (성공)          │                          │
+    │◄────────────────────────│                          │
+```
+
+### 9.6 용량 관리 (퇴출 로직)
+
+```go
+// ensureCapacity ensures there's room for the new transaction.
+func (mp *Mempool) ensureCapacity(newTx *Tx) error {
+    // 트랜잭션 수 체크
+    for mp.txCount >= mp.config.MaxTxs {
+        if err := mp.evictLowestPriority(newTx.GasPrice); err != nil {
+            return ErrMempoolFull
+        }
+    }
+
+    // 바이트 체크
+    for mp.txBytes+int64(newTx.Size()) > mp.config.MaxBytes {
+        if err := mp.evictLowestPriority(newTx.GasPrice); err != nil {
+            return ErrMempoolFull
+        }
+    }
+
+    return nil
+}
+
+// evictLowestPriority removes the lowest priority transaction.
+func (mp *Mempool) evictLowestPriority(minPrice uint64) error {
+    var lowestTx *Tx
+    var lowestPrice uint64 = ^uint64(0) // Max uint64
+
+    // 가장 낮은 가스 가격 찾기
+    for _, tx := range mp.txStore {
+        if tx.GasPrice < lowestPrice {
+            lowestPrice = tx.GasPrice
+            lowestTx = tx
+        }
+    }
+
+    if lowestTx == nil {
+        return errors.New("no transaction to evict")
+    }
+
+    // 새 트랜잭션보다 낮은 우선순위만 퇴출
+    if lowestPrice >= minPrice {
+        return errors.New("cannot evict higher priority transaction")
+    }
+
+    mp.removeTxLocked(lowestTx.ID, true)
+    return nil
+}
+```
+
+**퇴출 로직 예시:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           퇴출 (Eviction) 예시                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+현재 멤풀 (MaxTxs = 5, 가득 참):
+┌─────────────────────────────────────────────────────────────────────────┐
+│  tx1 (GasPrice: 100)                                                    │
+│  tx2 (GasPrice: 50)                                                     │
+│  tx3 (GasPrice: 30)   ← 가장 낮은 우선순위                              │
+│  tx4 (GasPrice: 80)                                                     │
+│  tx5 (GasPrice: 60)                                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+새 트랜잭션 도착: tx6 (GasPrice: 70)
+
+1. 멤풀 가득 참 (5 >= MaxTxs)
+2. 가장 낮은 우선순위 찾기 → tx3 (GasPrice: 30)
+3. tx6.GasPrice(70) > tx3.GasPrice(30) → 퇴출 가능!
+4. tx3 제거, tx6 추가
+
+결과:
+┌─────────────────────────────────────────────────────────────────────────┐
+│  tx1 (GasPrice: 100)                                                    │
+│  tx2 (GasPrice: 50)                                                     │
+│  tx6 (GasPrice: 70)   ← 새로 추가됨                                     │
+│  tx4 (GasPrice: 80)                                                     │
+│  tx5 (GasPrice: 60)                                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+만약 tx7 (GasPrice: 20) 이 오면?
+→ tx7.GasPrice(20) < 최소(50) → 퇴출 불가 → ErrMempoolFull
+```
+
+### 9.7 트랜잭션 조회 (ReapMaxTxs)
+
+```go
+// ReapMaxTxs returns up to max transactions for block proposal.
+// Transactions are sorted by priority (gas price).
+func (mp *Mempool) ReapMaxTxs(max int) []*Tx {
+    mp.mu.RLock()
+    defer mp.mu.RUnlock()
+
+    if max <= 0 || max > mp.config.MaxBatchTxs {
+        max = mp.config.MaxBatchTxs
+    }
+
+    if mp.txCount == 0 {
+        return nil
+    }
+
+    // 모든 트랜잭션을 슬라이스로 복사
+    txs := make([]*Tx, 0, mp.txCount)
+    for _, tx := range mp.txStore {
+        txs = append(txs, tx)
+    }
+
+    // 우선순위 정렬 (GasPrice 내림차순)
+    sort.Slice(txs, func(i, j int) bool {
+        return txs[i].GasPrice > txs[j].GasPrice
+    })
+
+    // 상위 max개 반환
+    if len(txs) > max {
+        txs = txs[:max]
+    }
+
+    return txs
+}
+```
+
+**ReapMaxTxs 사용 시점:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      블록 제안 시 트랜잭션 선택                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Primary Node              Mempool
+       │                       │
+       │  proposeBlock()       │
+       │                       │
+       │  ReapMaxTxs(500)      │
+       │ ─────────────────────►│
+       │                       │
+       │                       │ 1. 모든 tx 수집
+       │                       │
+       │                       │ 2. GasPrice 내림차순 정렬
+       │                       │    [100, 80, 70, 60, 50, ...]
+       │                       │
+       │                       │ 3. 상위 500개 선택
+       │                       │
+       │  []*Tx (정렬됨)       │
+       │◄───────────────────── │
+       │                       │
+       │  블록 생성            │
+       │                       │
+
+
+정렬 예시:
+
+정렬 전 (txStore 순서 = 무작위):
+  [tx3:30, tx1:100, tx5:60, tx2:50, tx4:80]
+
+정렬 후 (GasPrice 내림차순):
+  [tx1:100, tx4:80, tx5:60, tx2:50, tx3:30]
+      ↑
+   우선순위 높음 (먼저 블록에 포함)
+```
+
+### 9.8 블록 커밋 후 처리 (Update)
+
+```go
+// Update is called after a block is committed.
+func (mp *Mempool) Update(height int64, committedTxs [][]byte) error {
+    mp.mu.Lock()
+    defer mp.mu.Unlock()
+
+    mp.height = height
+
+    // 1. 커밋된 트랜잭션 제거
+    for _, txBytes := range committedTxs {
+        tx := NewTx(txBytes)
+        mp.removeTxLocked(tx.ID, true)  // 캐시에 추가
+    }
+
+    // 2. Recheck (선택적)
+    if mp.config.RecheckEnabled {
+        mp.recheckTxsLocked()
+    }
+
+    return nil
+}
+
+// recheckTxsLocked rechecks all remaining transactions.
+func (mp *Mempool) recheckTxsLocked() {
+    if mp.checkTxCallback == nil {
+        return
+    }
+
+    toRemove := make([]string, 0)
+
+    for id, tx := range mp.txStore {
+        // 재검증
+        if err := mp.checkTxCallback(tx); err != nil {
+            toRemove = append(toRemove, id)
+        }
+    }
+
+    // 무효 트랜잭션 제거
+    for _, id := range toRemove {
+        mp.removeTxLocked(id, false)
+    }
+}
+```
+
+**Update 흐름:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         블록 커밋 후 처리                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Consensus Engine            Mempool                    ABCI App
+       │                         │                          │
+       │  executeBlock() 완료    │                          │
+       │                         │                          │
+       │  Update(height=100,     │                          │
+       │     committedTxs)       │                          │
+       │ ───────────────────────►│                          │
+       │                         │                          │
+       │                         │ 1. 커밋된 tx 제거        │
+       │                         │    - txStore에서 삭제    │
+       │                         │    - senderIndex 갱신    │
+       │                         │    - 캐시에 추가         │
+       │                         │                          │
+       │                         │ 2. 높이 업데이트         │
+       │                         │    height = 100          │
+       │                         │                          │
+       │                         │ 3. Recheck               │
+       │                         │    (남은 tx 재검증)      │
+       │                         │ ────────────────────────►│
+       │                         │                          │ CheckTx
+       │                         │◄────────────────────────│
+       │                         │                          │
+       │                         │ 4. 무효 tx 제거          │
+       │                         │                          │
+       │  완료                   │                          │
+       │◄─────────────────────── │                          │
+
+
+왜 Recheck가 필요한가?
+
+블록 100에서:
+- tx_A: Alice → Bob 100원 (성공, 커밋됨)
+- tx_B: Alice → Charlie 50원 (멤풀에 대기 중)
+
+블록 커밋 후:
+- Alice 잔액이 100원 → 0원으로 변경
+- tx_B는 이제 무효 (잔액 부족)
+- Recheck로 tx_B 발견 → 제거
+```
+
+### 9.9 백그라운드 작업 (만료 처리)
+
+```go
+// expireLoop periodically removes expired transactions.
+func (mp *Mempool) expireLoop() {
+    ticker := time.NewTicker(mp.config.TTL / 2)  // 5분마다 체크
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-mp.ctx.Done():
+            return
+        case <-ticker.C:
+            mp.expireTxs()
+        }
+    }
+}
+
+// expireTxs removes expired transactions.
+func (mp *Mempool) expireTxs() {
+    mp.mu.Lock()
+    defer mp.mu.Unlock()
+
+    now := time.Now()
+    toRemove := make([]string, 0)
+
+    for id, tx := range mp.txStore {
+        if now.Sub(tx.Timestamp) > mp.config.TTL {  // 10분 경과
+            toRemove = append(toRemove, id)
+        }
+    }
+
+    for _, id := range toRemove {
+        mp.removeTxLocked(id, true)
+    }
+}
+```
+
+**TTL 만료 예시:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           TTL 만료 처리                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+시간 흐름:
+
+00:00  tx1 추가 (Timestamp: 00:00)
+00:03  tx2 추가 (Timestamp: 00:03)
+00:05  expireLoop 실행 → 만료된 tx 없음
+00:07  tx3 추가 (Timestamp: 00:07)
+00:10  expireLoop 실행
+       - tx1: 00:10 - 00:00 = 10분 → TTL 초과 → 제거!
+       - tx2: 00:10 - 00:03 = 7분 → OK
+       - tx3: 00:10 - 00:07 = 3분 → OK
+00:13  tx2 만료 예정...
+
+
+왜 TTL이 필요한가?
+
+1. 오래된 트랜잭션 정리
+   - 네트워크 혼잡으로 블록에 못 들어간 tx
+   - 낮은 가스 가격으로 계속 밀리는 tx
+
+2. 메모리 관리
+   - 무한정 쌓이는 것 방지
+
+3. 사용자 경험
+   - 너무 오래된 tx는 의미 없음
+   - 사용자가 다시 제출하도록 유도
+```
+
+### 9.10 Reactor (네트워크 연동)
+
+```go
+// mempool/reactor.go
+
+// Reactor connects the mempool to the network layer.
+type Reactor struct {
+    mu sync.RWMutex
+
+    config  *ReactorConfig
+    mempool *Mempool
+
+    // 네트워크 브로드캐스터
+    broadcaster Broadcaster
+
+    // 브로드캐스트 큐
+    broadcastQueue chan *Tx
+
+    // 상태
+    isRunning bool
+    ctx       context.Context
+    cancel    context.CancelFunc
+}
+
+// Broadcaster defines the interface for broadcasting transactions.
+type Broadcaster interface {
+    BroadcastTx(tx []byte) error
+    SendTx(peerID string, tx []byte) error
+}
+```
+
+**Reactor 역할:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              REACTOR                                     │
+│                                                                          │
+│   ┌───────────┐         ┌───────────┐         ┌───────────┐            │
+│   │   Client  │         │  Reactor  │         │   Peers   │            │
+│   └─────┬─────┘         └─────┬─────┘         └─────┬─────┘            │
+│         │                     │                     │                   │
+│         │  SubmitTx           │                     │                   │
+│         │────────────────────►│                     │                   │
+│         │                     │                     │                   │
+│         │                     │  AddTx to Mempool   │                   │
+│         │                     │────────┐            │                   │
+│         │                     │        │            │                   │
+│         │                     │◄───────┘            │                   │
+│         │                     │                     │                   │
+│         │                     │  BroadcastTx        │                   │
+│         │                     │────────────────────►│  다른 노드들에게  │
+│         │                     │                     │  전파             │
+│         │                     │                     │                   │
+│         │                     │◄────────────────────│                   │
+│         │                     │  ReceiveTx          │  다른 노드에서    │
+│         │                     │                     │  수신             │
+│         │                     │  AddTx to Mempool   │                   │
+│         │                     │────────┐            │                   │
+│         │                     │        │            │                   │
+│         │                     │◄───────┘            │                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.11 SubmitTx (클라이언트 → 네트워크)
+
+```go
+// SubmitTxWithMeta submits a transaction with metadata.
+func (r *Reactor) SubmitTxWithMeta(txBytes []byte, sender string, nonce, gasPrice, gasLimit uint64) error {
+    // 1. 멤풀에 추가
+    if err := r.mempool.AddTxWithMeta(txBytes, sender, nonce, gasPrice, gasLimit); err != nil {
+        return err
+    }
+
+    // 2. 브로드캐스트 큐에 추가
+    if r.config.BroadcastEnabled {
+        tx := NewTxWithMeta(txBytes, sender, nonce, gasPrice, gasLimit)
+        select {
+        case r.broadcastQueue <- tx:
+        default:
+            // 큐가 가득 차면 무시 (이미 멤풀에는 추가됨)
+        }
+    }
+
+    return nil
+}
+```
+
+### 9.12 브로드캐스트 루프
+
+```go
+// broadcastLoop handles broadcasting transactions to peers.
+func (r *Reactor) broadcastLoop() {
+    var batch []*Tx
+    ticker := time.NewTicker(r.config.BroadcastDelay)  // 10ms
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-r.ctx.Done():
+            return
+
+        case tx := <-r.broadcastQueue:
+            batch = append(batch, tx)
+
+            // 배치가 가득 차면 즉시 전송
+            if len(batch) >= r.config.MaxBroadcastBatch {
+                r.broadcastBatch(batch)
+                batch = nil
+            }
+
+        case <-ticker.C:
+            // 주기적으로 배치 전송
+            if len(batch) > 0 {
+                r.broadcastBatch(batch)
+                batch = nil
+            }
+        }
+    }
+}
+```
+
+**배치 브로드캐스트:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        배치 브로드캐스트                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+개별 전송 (비효율):
+  tx1 → 네트워크 → 대기
+  tx2 → 네트워크 → 대기
+  tx3 → 네트워크 → 대기
+  ...
+  총 100번의 네트워크 호출
+
+
+배치 전송 (효율적):
+  [tx1, tx2, tx3, ..., tx100] → 네트워크
+  10ms 동안 모아서 한 번에 전송
+  또는 100개 모이면 즉시 전송
+
+
+시간 흐름:
+
+00:00.000  tx1 도착 → batch = [tx1]
+00:00.003  tx2 도착 → batch = [tx1, tx2]
+00:00.007  tx3 도착 → batch = [tx1, tx2, tx3]
+00:00.010  ticker 발동 → broadcastBatch([tx1, tx2, tx3])
+                        batch = []
+00:00.015  tx4 도착 → batch = [tx4]
+...
+```
+
+### 9.13 Mempool과 PBFT 통합
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Mempool과 PBFT 통합 흐름                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+1. 트랜잭션 수신:
+   Client → Reactor.SubmitTx() → Mempool.AddTx() → CheckTx (ABCI)
+                              → Reactor.BroadcastTx() → 다른 노드들
+
+2. 블록 제안 (리더):
+   EngineV2.proposeBlock()
+       │
+       ├─▶ Mempool.ReapMaxTxs(500)  ← 상위 500개 트랜잭션 선택
+       │
+       ├─▶ ABCIAdapter.PrepareProposal()  ← 앱이 최종 정렬
+       │
+       └─▶ 블록 생성 & PrePrepare 브로드캐스트
+
+3. 블록 실행:
+   EngineV2.executeBlock()
+       │
+       ├─▶ ABCIAdapter.FinalizeBlock()  ← 블록 실행
+       │
+       ├─▶ ABCIAdapter.Commit()  ← 상태 확정
+       │
+       └─▶ Mempool.Update(height, committedTxs)  ← 커밋된 tx 제거
+
+
+전체 흐름 다이어그램:
+
+  Client          Mempool         EngineV2        ABCIAdapter      Cosmos App
+    │                │               │                │               │
+    │  SubmitTx      │               │                │               │
+    │───────────────►│               │                │               │
+    │                │               │                │               │
+    │                │  CheckTx      │                │               │
+    │                │───────────────┼───────────────►│───────────────►│
+    │                │◄──────────────┼────────────────│◄───────────────│
+    │                │               │                │               │
+    │                │               │  (리더만)      │               │
+    │                │  ReapMaxTxs   │                │               │
+    │                │◄──────────────│                │               │
+    │                │───────────────►│               │               │
+    │                │               │                │               │
+    │                │               │ PrepareProposal│               │
+    │                │               │───────────────►│───────────────►│
+    │                │               │◄───────────────│◄───────────────│
+    │                │               │                │               │
+    │                │               │  PBFT 합의...  │               │
+    │                │               │                │               │
+    │                │               │ FinalizeBlock  │               │
+    │                │               │───────────────►│───────────────►│
+    │                │               │◄───────────────│◄───────────────│
+    │                │               │                │               │
+    │                │  Update       │                │               │
+    │                │◄──────────────│                │               │
+    │                │ (커밋된 tx 제거)               │               │
+```
+
+---
+
+## 10. 요약 정리
+
+### 10.1 계층 구조 요약
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -2926,11 +3838,13 @@ node0.Broadcast(PrePrepare)
 │  ABCI Client   │  abci/client.go        │  gRPC 통신 (Cosmos SDK)        │
 │  Types         │  abci/types.go         │  헬퍼 함수, 데이터 변환        │
 │  Transport     │  transport/grpc.go     │  P2P 통신 (노드 간)            │
+│  Mempool       │  mempool/mempool.go    │  트랜잭션 대기열 관리          │
+│  Reactor       │  mempool/reactor.go    │  트랜잭션 네트워크 전파        │
 │  Protobuf      │  api/pbft/v1/*.go      │  메시지 정의                   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.2 ABCI 메서드 매핑
+### 10.2 ABCI 메서드 매핑
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -2945,14 +3859,28 @@ node0.Broadcast(PrePrepare)
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.3 전체 데이터 흐름
+### 10.3 전체 데이터 흐름
 
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         전체 데이터 흐름                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
 사용자 요청 (트랜잭션)
        │
        ▼
 ┌─────────────────┐
-│     Node        │  SubmitTx()
+│    Reactor      │  SubmitTx() - 네트워크 전파
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│    Mempool      │  AddTx() - 검증 후 저장
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│     Node        │  SubmitTx() - 엔진에 전달
 └────────┬────────┘
          │
          ▼
@@ -2973,12 +3901,86 @@ node0.Broadcast(PrePrepare)
          ▼
 ┌─────────────────┐
 │  Cosmos SDK 앱  │  트랜잭션 실행, 상태 변경
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│    Mempool      │  Update() - 커밋된 tx 제거
 └─────────────────┘
 ```
 
-### 9.4 핵심 포인트
+### 10.4 Mempool 요약
 
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Mempool 요약                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+역할:
+  - 트랜잭션 임시 저장 (블록에 포함될 때까지)
+  - 우선순위 관리 (GasPrice 기준)
+  - 중복/무효 트랜잭션 필터링
+  - 만료 트랜잭션 정리
+
+저장소:
+  - txStore: 빠른 조회 (O(1))
+  - senderIndex: 발신자별 관리 (nonce 순서)
+  - senderNonce: 리플레이 공격 방지
+
+주요 메서드:
+  - AddTx(): 트랜잭션 추가 (검증 포함)
+  - ReapMaxTxs(): 블록용 트랜잭션 선택
+  - Update(): 블록 커밋 후 정리
+
+용량 관리:
+  - MaxTxs: 최대 5000개
+  - MaxBytes: 최대 1GB
+  - TTL: 10분 후 만료
+  - 퇴출: 낮은 GasPrice 우선 제거
+
+Reactor:
+  - 네트워크 전파 담당
+  - 배치 브로드캐스트 (효율성)
+  - 다른 노드에서 수신
+```
+
+### 10.5 GRPCTransport 요약
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       GRPCTransport 요약                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+역할:
+  - 노드 간 P2P 통신
+  - PBFT 메시지 송수신
+
+구조:
+  - 서버: 다른 노드의 연결 수신
+  - 클라이언트: 다른 노드에 연결
+
+주요 메서드:
+  - Start(): gRPC 서버 시작
+  - AddPeer(): 피어 연결
+  - Broadcast(): 모든 피어에 전송 (병렬)
+  - Send(): 특정 피어에 전송
+
+타입 변환:
+  - messageToProto(): PBFT → Protobuf (전송용)
+  - protoToMessage(): Protobuf → PBFT (수신용)
+
+메시지 수신:
+  - BroadcastMessage() 핸들러
+  - msgHandler 콜백 → Engine.msgChan
+```
+
+### 10.6 핵심 포인트
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           핵심 포인트                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
 1. PBFT 합의 로직은 변경 없음
    - PrePrepare → Prepare → Commit 동일
    - 2f+1 투표 로직 동일
@@ -2992,9 +3994,24 @@ node0.Broadcast(PrePrepare)
    - EngineV2: 합의만 담당
    - ABCIAdapter: 변환만 담당
    - Client: 통신만 담당
+   - Mempool: 트랜잭션 관리만 담당
+   - Transport: P2P 통신만 담당
    
 4. 장점
    - 표준 ABCI 인터페이스 사용 → 어떤 Cosmos SDK 앱이든 연결 가능
    - 계층 분리 → 테스트 용이 (Mock 사용 가능)
    - 코드 가독성 향상
+   - 각 컴포넌트 독립적 개발/테스트 가능
+
+5. 메시지 흐름 (PBFT)
+   - PrePrepare: 리더 → 모든 노드
+   - Prepare: 모든 노드 → 모든 노드 (브로드캐스트)
+   - Commit: 모든 노드 → 모든 노드 (브로드캐스트)
+
+6. 트랜잭션 흐름
+   - 클라이언트 → Reactor → Mempool → 검증 → 저장
+   - Mempool → Engine → PrepareProposal → 블록 생성
+   - 블록 커밋 → Mempool.Update() → 커밋된 tx 제거
 ```
+
+---
