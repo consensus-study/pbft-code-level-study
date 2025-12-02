@@ -2312,6 +2312,603 @@ func (e *EngineV2) handleNewView(msg *Message) {
   node1이 새 블록 제안 시작!
 ```
 
+### 8.17 GRPCTransport 상세 (transport/grpc.go)
+
+```go
+// transport/grpc.go
+
+// GRPCTransport implements gRPC-based P2P communication for PBFT.
+type GRPCTransport struct {
+    mu sync.RWMutex
+
+    nodeID   string           // 이 노드의 ID
+    address  string           // 리슨 주소 (예: "0.0.0.0:26656")
+    server   *grpc.Server     // gRPC 서버
+    listener net.Listener     // TCP 리스너
+
+    // Peer connections (다른 노드들과의 연결)
+    peers map[string]*peerConn  // nodeID → peerConn
+
+    // Message handler callback (Engine으로 메시지 전달)
+    msgHandler func(*pbft.Message)
+
+    // Running state
+    running bool
+    done    chan struct{}
+
+    // Embed for forward compatibility
+    pbftv1.UnimplementedPBFTServiceServer
+}
+
+// peerConn represents a connection to a peer node.
+type peerConn struct {
+    id     string                      // 피어 노드 ID
+    addr   string                      // 피어 주소
+    conn   *grpc.ClientConn            // gRPC 연결
+    client pbftv1.PBFTServiceClient    // gRPC 클라이언트
+}
+```
+
+**GRPCTransport 구조:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         GRPCTransport 구조                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    GRPCTransport (node0)
+┌───────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│   nodeID: "node0"                                                     │
+│   address: "0.0.0.0:26656"                                            │
+│                                                                       │
+│   ┌─────────────────────────────────────────────────────────────┐    │
+│   │                    gRPC Server                               │    │
+│   │  (다른 노드로부터 메시지 수신)                                │    │
+│   │                                                              │    │
+│   │  BroadcastMessage() ← 브로드캐스트 메시지 수신               │    │
+│   │  SendMessage()      ← 직접 메시지 수신                       │    │
+│   │  MessageStream()    ← 스트림 메시지 수신                     │    │
+│   └─────────────────────────────────────────────────────────────┘    │
+│                              │                                        │
+│                              │ msgHandler(msg)                        │
+│                              ▼                                        │
+│                    ┌─────────────────┐                                │
+│                    │  Engine.msgChan │                                │
+│                    └─────────────────┘                                │
+│                                                                       │
+│   peers map:                                                          │
+│   ┌─────────────────────────────────────────────────────────────┐    │
+│   │  "node1" → peerConn{conn, client} ──▶ node1:26656           │    │
+│   │  "node2" → peerConn{conn, client} ──▶ node2:26656           │    │
+│   │  "node3" → peerConn{conn, client} ──▶ node3:26656           │    │
+│   └─────────────────────────────────────────────────────────────┘    │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.18 GRPCTransport 생성 및 시작
+
+```go
+// 생성자
+func NewGRPCTransport(nodeID, address string) (*GRPCTransport, error) {
+    return &GRPCTransport{
+        nodeID:  nodeID,
+        address: address,
+        peers:   make(map[string]*peerConn),
+        done:    make(chan struct{}),
+    }, nil
+}
+
+// Start starts the gRPC server.
+func (t *GRPCTransport) Start() error {
+    // 1. TCP 리스너 생성
+    listener, err := net.Listen("tcp", t.address)
+    if err != nil {
+        return fmt.Errorf("failed to listen on %s: %w", t.address, err)
+    }
+    t.listener = listener
+
+    // 2. gRPC 서버 생성 (64MB 메시지 크기 제한)
+    t.server = grpc.NewServer(
+        grpc.MaxRecvMsgSize(64 * 1024 * 1024), // 64MB
+        grpc.MaxSendMsgSize(64 * 1024 * 1024),
+    )
+    
+    // 3. PBFT 서비스 등록
+    pbftv1.RegisterPBFTServiceServer(t.server, t)
+
+    t.mu.Lock()
+    t.running = true
+    t.mu.Unlock()
+
+    // 4. 고루틴으로 서버 실행 (블로킹 방지)
+    go func() {
+        if err := t.server.Serve(listener); err != nil {
+            t.mu.RLock()
+            running := t.running
+            t.mu.RUnlock()
+            if running {
+                fmt.Printf("[GRPCTransport] Server error: %v\n", err)
+            }
+        }
+    }()
+
+    fmt.Printf("[GRPCTransport] Started on %s\n", t.address)
+    return nil
+}
+```
+
+**Start() 흐름:**
+
+```
+Start() 호출
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1. net.Listen("tcp", "0.0.0.0:26656")                                  │
+│     → TCP 포트 열기                                                      │
+│     → "이 포트로 연결 기다림"                                             │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  2. grpc.NewServer(MaxRecvMsgSize, MaxSendMsgSize)                      │
+│     → gRPC 서버 인스턴스 생성                                            │
+│     → 64MB 메시지 제한 (큰 블록도 전송 가능)                              │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  3. pbftv1.RegisterPBFTServiceServer(server, t)                         │
+│     → PBFT 서비스 핸들러 등록                                            │
+│     → t가 PBFTServiceServer 인터페이스 구현                              │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  4. go server.Serve(listener)                                           │
+│     → 고루틴으로 실행 (메인 스레드 블로킹 방지)                           │
+│     → 연결 대기 시작                                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.19 피어 연결 (AddPeer)
+
+```go
+// AddPeer connects to a remote peer.
+func (t *GRPCTransport) AddPeer(nodeID, address string) error {
+    // 1. 타임아웃 설정 (10초)
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    // 2. gRPC 연결 (클라이언트로서)
+    conn, err := grpc.DialContext(
+        ctx,
+        address,
+        grpc.WithTransportCredentials(insecure.NewCredentials()),  // TLS 없이
+        grpc.WithBlock(),  // 연결될 때까지 블로킹
+    )
+    if err != nil {
+        return fmt.Errorf("failed to connect to peer %s at %s: %w", nodeID, address, err)
+    }
+
+    // 3. PBFT 클라이언트 생성
+    client := pbftv1.NewPBFTServiceClient(conn)
+
+    // 4. peers 맵에 저장
+    t.mu.Lock()
+    t.peers[nodeID] = &peerConn{
+        id:     nodeID,
+        addr:   address,
+        conn:   conn,
+        client: client,
+    }
+    t.mu.Unlock()
+
+    fmt.Printf("[GRPCTransport] Connected to peer %s at %s\n", nodeID, address)
+    return nil
+}
+```
+
+**피어 연결 다이어그램:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         피어 연결 과정                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+node0이 node1에 연결:
+
+    node0                                           node1
+      │                                               │
+      │  grpc.DialContext("node1:26656")              │
+      │ ─────────────────────────────────────────────▶│
+      │                                               │
+      │              TCP 연결 수립                      │
+      │ ◀─────────────────────────────────────────────│
+      │                                               │
+      │  NewPBFTServiceClient(conn)                   │
+      │                                               │
+      │                                               │
+      ▼                                               │
+┌─────────────────┐                                   │
+│ peers["node1"]  │                                   │
+│ = peerConn{     │                                   │
+│   id: "node1"   │                                   │
+│   addr: "..."   │                                   │
+│   conn: conn    │ ──── gRPC 연결 ────────────────────│
+│   client: client│                                   │
+│ }               │                                   │
+└─────────────────┘                                   │
+
+4개 노드 연결 상태 (node0 기준):
+
+node0.peers = {
+    "node1": peerConn ──▶ node1:26656
+    "node2": peerConn ──▶ node2:26656
+    "node3": peerConn ──▶ node3:26656
+}
+
+node0은:
+- 서버로서: node1, node2, node3의 연결을 받음 (수신)
+- 클라이언트로서: node1, node2, node3에 연결 (송신)
+```
+
+### 8.20 브로드캐스트 (Broadcast)
+
+```go
+// Broadcast sends a message to all connected peers.
+func (t *GRPCTransport) Broadcast(msg *pbft.Message) error {
+    // 1. 피어 목록 복사 (락 최소화)
+    t.mu.RLock()
+    peers := make([]*peerConn, 0, len(t.peers))
+    for _, peer := range t.peers {
+        peers = append(peers, peer)
+    }
+    t.mu.RUnlock()
+
+    // 2. PBFT Message → Protobuf 변환
+    protoMsg := messageToProto(msg)
+
+    // 3. 모든 피어에게 병렬 전송
+    var wg sync.WaitGroup
+    var errMu sync.Mutex
+    var lastErr error
+
+    for _, peer := range peers {
+        wg.Add(1)
+        go func(p *peerConn) {
+            defer wg.Done()
+            
+            // 타임아웃 5초
+            ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+            defer cancel()
+
+            // gRPC 호출
+            _, err := p.client.BroadcastMessage(ctx, &pbftv1.BroadcastMessageRequest{
+                Message: protoMsg,
+            })
+            if err != nil {
+                errMu.Lock()
+                lastErr = err
+                errMu.Unlock()
+                fmt.Printf("[GRPCTransport] Broadcast to %s failed: %v\n", p.id, err)
+            }
+        }(peer)
+    }
+    
+    // 4. 모든 전송 완료 대기
+    wg.Wait()
+
+    return lastErr
+}
+```
+
+**Broadcast 병렬 전송:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Broadcast 병렬 전송                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+node0.Broadcast(PrePrepareMsg)
+
+         │
+         │  peers 복사
+         ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  peers = [node1, node2, node3]                                  │
+    └─────────────────────────────────────────────────────────────────┘
+         │
+         │  병렬 전송 (고루틴)
+         │
+    ┌────┴────┬────────────┬────────────┐
+    │         │            │            │
+    ▼         ▼            ▼            │
+┌──────┐  ┌──────┐    ┌──────┐         │
+│ go   │  │ go   │    │ go   │         │
+│ send │  │ send │    │ send │         │
+│ to   │  │ to   │    │ to   │         │
+│node1 │  │node2 │    │node3 │         │
+└──┬───┘  └──┬───┘    └──┬───┘         │
+   │         │           │             │
+   │ gRPC    │ gRPC      │ gRPC        │
+   ▼         ▼           ▼             │
+ node1     node2       node3           │
+                                       │
+                                       │
+   └─────────┴───────────┴─────────────┘
+                    │
+                    │  wg.Wait() - 모두 완료 대기
+                    ▼
+               return lastErr
+
+
+시간 비교:
+
+순차 전송 (안 좋음):              병렬 전송 (좋음):
+  node1 ─── 100ms                  node1 ┐
+  node2 ─── 100ms                  node2 ├── 100ms (동시)
+  node3 ─── 100ms                  node3 ┘
+  ─────────────────                ─────────────
+  총 300ms                         총 100ms
+```
+
+### 8.21 메시지 수신 (BroadcastMessage 서버 핸들러)
+
+```go
+// BroadcastMessage handles incoming broadcast messages from peers.
+func (t *GRPCTransport) BroadcastMessage(ctx context.Context, req *pbftv1.BroadcastMessageRequest) (*pbftv1.BroadcastMessageResponse, error) {
+    // 1. 핸들러가 설정되어 있고, 메시지가 있으면
+    if t.msgHandler != nil && req.Message != nil {
+        // 2. Protobuf → PBFT Message 변환
+        msg := protoToMessage(req.Message)
+        
+        // 3. Engine으로 전달!
+        t.msgHandler(msg)  // → engine.handleIncomingMessage()
+    }
+    
+    return &pbftv1.BroadcastMessageResponse{Success: true}, nil
+}
+```
+
+**메시지 수신 흐름:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       메시지 수신 흐름                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+node1이 node0에게 Prepare 전송:
+
+node1                               node0
+  │                                   │
+  │  BroadcastMessage(PrepareMsg)     │
+  │ ─────────────────────────────────▶│
+  │                                   │
+  │                         ┌─────────▼─────────┐
+  │                         │  BroadcastMessage │
+  │                         │  (서버 핸들러)     │
+  │                         └─────────┬─────────┘
+  │                                   │
+  │                                   │ protoToMessage()
+  │                                   │ (Protobuf → PBFT)
+  │                                   │
+  │                                   ▼
+  │                         ┌─────────────────────┐
+  │                         │  msgHandler(msg)    │
+  │                         │                     │
+  │                         │  = engine.handle    │
+  │                         │    IncomingMessage  │
+  │                         └─────────┬───────────┘
+  │                                   │
+  │                                   ▼
+  │                         ┌─────────────────────┐
+  │                         │  engine.msgChan     │
+  │                         │      <- msg         │
+  │                         └─────────┬───────────┘
+  │                                   │
+  │                                   ▼
+  │                         ┌─────────────────────┐
+  │                         │  handlePrepare(msg) │
+  │                         └─────────────────────┘
+  │                                   │
+  │       Success: true               │
+  │ ◀─────────────────────────────────│
+```
+
+### 8.22 타입 변환 함수
+
+```go
+// messageToProto converts a PBFT Message to protobuf format.
+// 전송 시 사용 (PBFT → Protobuf)
+func messageToProto(msg *pbft.Message) *pbftv1.PBFTMessage {
+    return &pbftv1.PBFTMessage{
+        Type:        convertMessageType(msg.Type),      // enum 변환
+        View:        msg.View,
+        SequenceNum: msg.SequenceNum,
+        Digest:      msg.Digest,
+        NodeId:      msg.NodeID,
+        Timestamp:   timestamppb.New(msg.Timestamp),    // time.Time → Timestamp
+        Signature:   msg.Signature,
+        Payload:     msg.Payload,
+    }
+}
+
+// protoToMessage converts a protobuf message to PBFT Message format.
+// 수신 시 사용 (Protobuf → PBFT)
+func protoToMessage(proto *pbftv1.PBFTMessage) *pbft.Message {
+    var ts time.Time
+    if proto.Timestamp != nil {
+        ts = proto.Timestamp.AsTime()  // Timestamp → time.Time
+    }
+
+    return &pbft.Message{
+        Type:        convertProtoMessageType(proto.Type),  // enum 변환
+        View:        proto.View,
+        SequenceNum: proto.SequenceNum,
+        Digest:      proto.Digest,
+        NodeID:      proto.NodeId,
+        Timestamp:   ts,
+        Signature:   proto.Signature,
+        Payload:     proto.Payload,
+    }
+}
+
+// MessageType 변환 (PBFT → Protobuf)
+func convertMessageType(mt pbft.MessageType) pbftv1.MessageType {
+    switch mt {
+    case pbft.PrePrepare:
+        return pbftv1.MessageType_MESSAGE_TYPE_PRE_PREPARE
+    case pbft.Prepare:
+        return pbftv1.MessageType_MESSAGE_TYPE_PREPARE
+    case pbft.Commit:
+        return pbftv1.MessageType_MESSAGE_TYPE_COMMIT
+    case pbft.ViewChange:
+        return pbftv1.MessageType_MESSAGE_TYPE_VIEW_CHANGE
+    case pbft.NewView:
+        return pbftv1.MessageType_MESSAGE_TYPE_NEW_VIEW
+    case pbft.CheckpointMsgType:
+        return pbftv1.MessageType_MESSAGE_TYPE_CHECKPOINT
+    default:
+        return pbftv1.MessageType_MESSAGE_TYPE_UNSPECIFIED
+    }
+}
+```
+
+**타입 변환 다이어그램:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         타입 변환 흐름                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+전송 시 (node0 → node1):
+
+  pbft.Message                 pbftv1.PBFTMessage              네트워크
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────┐
+│ Type: PrePrepare│          │ Type: PRE_PREPARE│          │             │
+│ View: 0         │ ───────▶ │ View: 0         │ ───────▶ │   bytes     │
+│ SequenceNum: 1  │ message  │ SequenceNum: 1  │ protobuf │ (직렬화)    │
+│ Timestamp: time │ ToProto  │ Timestamp: pb.T │ marshal  │             │
+│ Payload: []byte │          │ Payload: []byte │          │             │
+└─────────────────┘          └─────────────────┘          └─────────────┘
+
+
+수신 시 (node1에서):
+
+     네트워크               pbftv1.PBFTMessage              pbft.Message
+┌─────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│             │          │ Type: PRE_PREPARE│          │ Type: PrePrepare│
+│   bytes     │ ───────▶ │ View: 0         │ ───────▶ │ View: 0         │
+│ (직렬화)    │ protobuf │ SequenceNum: 1  │ proto    │ SequenceNum: 1  │
+│             │ unmarshal│ Timestamp: pb.T │ ToMessage│ Timestamp: time │
+│             │          │ Payload: []byte │          │ Payload: []byte │
+└─────────────┘          └─────────────────┘          └─────────────────┘
+```
+
+### 8.23 TransportInterface
+
+```go
+// TransportInterface defines the interface for PBFT transport layer.
+// This allows for different implementations (gRPC, TCP, mock).
+type TransportInterface interface {
+    Start() error
+    Stop()
+    AddPeer(nodeID, address string) error
+    RemovePeer(nodeID string)
+    Broadcast(msg *pbft.Message) error
+    Send(nodeID string, msg *pbft.Message) error
+    SetMessageHandler(handler func(*pbft.Message))
+    GetPeers() []string
+    PeerCount() int
+}
+
+// Ensure GRPCTransport implements TransportInterface
+var _ TransportInterface = (*GRPCTransport)(nil)
+```
+
+**인터페이스 설계 이점:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   TransportInterface 장점                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+인터페이스를 사용하면 다양한 구현 가능:
+
+                    TransportInterface
+                           │
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+         ▼                 ▼                 ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  GRPCTransport  │ │  TCPTransport   │ │  MockTransport  │
+│  (프로덕션)      │ │  (경량)          │ │  (테스트)        │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+
+Engine은 TransportInterface만 알면 됨:
+
+type EngineV2 struct {
+    transport TransportInterface  // 어떤 구현이든 OK
+    ...
+}
+
+// 프로덕션
+engine.transport = NewGRPCTransport(...)
+
+// 테스트
+engine.transport = NewMockTransport(...)  // 네트워크 없이 테스트 가능
+```
+
+### 8.24 전체 네트워크 토폴로지
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    4개 노드 네트워크 토폴로지                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+모든 노드가 서로 연결 (Full Mesh):
+
+         ┌─────────────────────────────────────────┐
+         │                                         │
+         │    node0:26656 ◀─────────────────────┐  │
+         │        │                              │  │
+         │        │  ┌───────────────────────┐   │  │
+         │        │  │                       │   │  │
+         │        ▼  ▼                       │   │  │
+         │    node1:26656 ◀───────────┐      │   │  │
+         │        │                    │      │   │  │
+         │        │  ┌─────────────┐   │      │   │  │
+         │        │  │             │   │      │   │  │
+         │        ▼  ▼             │   │      │   │  │
+         │    node2:26656 ◀────┐   │   │      │   │  │
+         │        │             │   │   │      │   │  │
+         │        │             │   │   │      │   │  │
+         │        ▼             │   │   │      │   │  │
+         │    node3:26656 ──────┴───┴───┴──────┴───┘  │
+         │                                         │
+         └─────────────────────────────────────────┘
+
+각 노드의 peers 맵:
+
+node0.peers = {node1, node2, node3}  → 3개 연결
+node1.peers = {node0, node2, node3}  → 3개 연결
+node2.peers = {node0, node1, node3}  → 3개 연결
+node3.peers = {node0, node1, node2}  → 3개 연결
+
+총 연결 수: 4 × 3 = 12 (양방향이므로 실제 TCP 연결은 6개)
+
+메시지 흐름 예시 (node0이 PrePrepare 브로드캐스트):
+
+node0.Broadcast(PrePrepare)
+    │
+    ├──▶ node0.peers["node1"].client.BroadcastMessage() ──▶ node1
+    ├──▶ node0.peers["node2"].client.BroadcastMessage() ──▶ node2
+    └──▶ node0.peers["node3"].client.BroadcastMessage() ──▶ node3
+```
+
 ---
 
 ## 9. 요약 정리
@@ -2401,4 +2998,3 @@ func (e *EngineV2) handleNewView(msg *Message) {
    - 계층 분리 → 테스트 용이 (Mock 사용 가능)
    - 코드 가독성 향상
 ```
-
